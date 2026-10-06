@@ -37,33 +37,22 @@ const (
 
 // Encode encodes the data into a binary record format suitable for writing to disk.
 func Encode(data []byte) []byte {
-	// TODO: Implement
-	// 1. Allocate a buffer of size HeaderSize + len(data)
 	recordBuffer := make([]byte, HeaderSize+len(data))
-	// 2. Write the length
 	binary.LittleEndian.PutUint32(recordBuffer[CRCSize:RecordSizeLength], uint32(len(data)))
-	// 3. Write the data
 	copy(recordBuffer[HeaderSize:], data)
-	// 4. Calculate CRC32 of length + data
 	checkSum := crc32.ChecksumIEEE(recordBuffer[CRCSize:])
-	// 5. Write the CRC
 	binary.LittleEndian.PutUint32(recordBuffer[0:CRCSize], checkSum)
 	return recordBuffer
 }
 
 // Decode decodes a binary record back into its components and verifies the CRC.
 func Decode(buf []byte) (*Record, error) {
-	// TODO: Implement
-	// 1. Check if buf is at least HeaderSize
 	if len(buf) < HeaderSize {
 		return nil, errors.New("size less than header size")
 	}
-	// 2. Read CRC and Length
 	originalCheckSum := binary.LittleEndian.Uint32(buf[0:CRCSize])
 	dataLength := binary.LittleEndian.Uint32(buf[CRCSize:RecordSizeLength])
-	// 3. Read Data
 	data := buf[HeaderSize:]
-	// 4. Verify CRC
 	calculatedCheckSum := crc32.ChecksumIEEE(buf[CRCSize:])
 	if originalCheckSum != calculatedCheckSum {
 		return nil, errors.New("corrupted data!!! checksum doesn't match")
