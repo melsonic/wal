@@ -15,30 +15,34 @@ import (
 //
 // When written to disk, it is serialized in a specific binary format:
 //
-//	+---------+------------+------------------+
-//	| CRC (4) | Length (4) |    Data (N)      |
-//	+---------+------------+------------------+
+//	+---------+---------+------------+------------------+
+//	| CRC (4) | Seq (8) | Length (4) |    Data (N)      |
+//	+---------+---------+------------+------------------+
 //
-// 1. CRC (4 bytes, Little Endian): A checksum calculated over Length + Data.
-// 2. Length (4 bytes, Little Endian): The size of the Data payload in bytes.
-// 3. Data (N bytes): The actual user payload.
+// 1. CRC (4 bytes, Little Endian): A checksum calculated over Seq + Length + Data.
+// 2. Seq (8 bytes, Little Endian): The global sequence number of the entry.
+// 3. Length (4 bytes, Little Endian): The size of the Data payload in bytes.
+// 4. Data (N bytes): The actual user payload.
 type Record struct {
 	CRC    uint32 // CRC32 checksum for data integrity
+	Seq    uint64 // Global sequence number
 	Length uint32 // Length of the data payload
 	Data   []byte // The actual data appended by the user
 }
 
 const (
 	CRCSize          = 4
+	SeqSize          = 8
 	RecordSizeLength = 4
-	// HeaderSize is the size of the record header (CRC + Length).
-	HeaderSize = CRCSize + RecordSizeLength
+	// HeaderSize is the size of the record header (CRC + Seq + Length).
+	HeaderSize = CRCSize + SeqSize + RecordSizeLength
 )
 
 // Encode encodes the data into a binary record format suitable for writing to disk.
-func Encode(data []byte) []byte {
+func Encode(seq uint64, data []byte) []byte {
 	recordBuffer := make([]byte, HeaderSize+len(data))
-	binary.LittleEndian.PutUint32(recordBuffer[CRCSize:RecordSizeLength], uint32(len(data)))
+	binary.LittleEndian.PutUint64(recordBuffer[CRCSize:CRCSize+SeqSize], seq)
+	binary.LittleEndian.PutUint32(recordBuffer[CRCSize+SeqSize:HeaderSize], uint32(len(data)))
 	copy(recordBuffer[HeaderSize:], data)
 	checkSum := crc32.ChecksumIEEE(recordBuffer[CRCSize:])
 	binary.LittleEndian.PutUint32(recordBuffer[0:CRCSize], checkSum)
@@ -51,14 +55,18 @@ func Decode(buf []byte) (*Record, error) {
 		return nil, errors.New("size less than header size")
 	}
 	originalCheckSum := binary.LittleEndian.Uint32(buf[0:CRCSize])
-	dataLength := binary.LittleEndian.Uint32(buf[CRCSize:RecordSizeLength])
+	seq := binary.LittleEndian.Uint64(buf[CRCSize : CRCSize+SeqSize])
+	dataLength := binary.LittleEndian.Uint32(buf[CRCSize+SeqSize : HeaderSize])
 	data := buf[HeaderSize:]
+
 	calculatedCheckSum := crc32.ChecksumIEEE(buf[CRCSize:])
 	if originalCheckSum != calculatedCheckSum {
 		return nil, errors.New("corrupted data!!! checksum doesn't match")
 	}
+
 	record := Record{
 		CRC:    originalCheckSum,
+		Seq:    seq,
 		Length: dataLength,
 		Data:   data,
 	}
