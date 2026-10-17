@@ -5,6 +5,9 @@ import (
 	"fmt"
 	"os"
 	"testing"
+
+	"go.uber.org/zap"
+	"go.uber.org/zap/zaptest/observer"
 )
 
 func TestWALBasicAppendAndRead(t *testing.T) {
@@ -265,4 +268,84 @@ func TestWALCircularBufferMaxSegmentOne(t *testing.T) {
 	}
 
 	w.Close()
+}
+
+func TestWALZapLogging(t *testing.T) {
+	dir, err := os.MkdirTemp("", "wal-test-logging-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(dir)
+
+	core, recordedLogs := observer.New(zap.DebugLevel)
+	logger := zap.New(core)
+
+	opts := DefaultOptions()
+	opts.Logger = logger
+	opts.MaxSegmentSize = 64 // Force rapid rotation
+
+	w, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("Open failed: %v", err)
+	}
+
+	// Append entries to trigger rotation
+	for i := range 5 {
+		_, err := w.Append([]byte(fmt.Sprintf("entry-%d", i)))
+		if err != nil {
+			t.Fatalf("Append failed: %v", err)
+		}
+	}
+
+	// Read entry
+	_, err = w.Read(0)
+	if err != nil && err != ErrNotFound {
+		t.Fatalf("Read failed: %v", err)
+	}
+
+	// Read non-existent
+	_, err = w.Read(9999)
+	if err != ErrNotFound {
+		t.Fatalf("Expected ErrNotFound, got %v", err)
+	}
+
+	err = w.Sync()
+	if err != nil {
+		t.Fatalf("Sync failed: %v", err)
+	}
+
+	err = w.Close()
+	if err != nil {
+		t.Fatalf("Close failed: %v", err)
+	}
+
+	// Reopen to test recovery logging
+	w2, err := Open(dir, opts)
+	if err != nil {
+		t.Fatalf("Reopen failed: %v", err)
+	}
+	w2.Close()
+
+	// Verify observed logs
+	messages := make(map[string]int)
+	for _, log := range recordedLogs.All() {
+		messages[log.Message]++
+	}
+
+	expectedMessages := []string{
+		"opening WAL",
+		"initialized new WAL",
+		"appended record",
+		"rotating segment",
+		"syncing WAL to disk",
+		"closing WAL",
+		"WAL closed successfully",
+		"recovered existing WAL state",
+	}
+
+	for _, msg := range expectedMessages {
+		if messages[msg] == 0 {
+			t.Errorf("Expected log message %q was not found in recorded logs", msg)
+		}
+	}
 }
