@@ -18,6 +18,7 @@
 package wal
 
 import (
+	"context"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -29,6 +30,11 @@ import (
 	"sync"
 	"time"
 
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/metric"
+	"go.opentelemetry.io/otel/trace"
 	"go.uber.org/zap"
 
 	"melsonic/wal/internal/record"
@@ -74,6 +80,7 @@ type WAL struct {
 	activeSize  uint64        // Current size in bytes of the active .seg file
 	options     *Options
 	logger      *zap.Logger
+	telemetry   *walTelemetry
 
 	closeCh chan struct{}
 	wg      sync.WaitGroup
@@ -99,6 +106,12 @@ type Options struct {
 	// Logger specifies a zap structured logger for WAL operations.
 	// If nil, zap.L() (or zap.NewNop()) is used.
 	Logger *zap.Logger
+	// TracerProvider specifies an OpenTelemetry TracerProvider for tracing WAL operations.
+	// If nil, the global OpenTelemetry TracerProvider (otel.GetTracerProvider()) is used.
+	TracerProvider trace.TracerProvider
+	// MeterProvider specifies an OpenTelemetry MeterProvider for WAL metrics.
+	// If nil, the global OpenTelemetry MeterProvider (otel.GetMeterProvider()) is used.
+	MeterProvider metric.MeterProvider
 }
 
 // DefaultOptions returns a set of sensible default configurations for the WAL.
@@ -205,6 +218,13 @@ func createSegment(logger *zap.Logger, dir string, slotID int, baseSeq uint64) (
 }
 
 // Open initializes or recovers a Write-Ahead Log instance from the given directory path.
+// It is equivalent to OpenContext with context.Background().
+func Open(path string, opts Options) (*WAL, error) {
+	return OpenContext(context.Background(), path, opts)
+}
+
+// OpenContext initializes or recovers a Write-Ahead Log instance from the given directory path
+// using the provided context for OpenTelemetry tracing.
 // It will parse all existing segment files in the directory to reconstruct the WAL state.
 // If the directory does not exist or has no segments, it initializes a brand new WAL
 // starting at sequence number 0.
@@ -212,7 +232,36 @@ func createSegment(logger *zap.Logger, dir string, slotID int, baseSeq uint64) (
 // Recovery Process:
 // During crash recovery or normal startup, Open looks at the old segments to find the
 // max valid sequence, and initializes the "next sequence" to resume operations safely.
-func Open(path string, opts Options) (*WAL, error) {
+func OpenContext(ctx context.Context, path string, opts Options) (walInstance *WAL, err error) {
+	tp := opts.TracerProvider
+	if tp == nil {
+		tp = otel.GetTracerProvider()
+	}
+	tracer := tp.Tracer(instrumentationScope)
+
+	ctx, span := tracer.Start(ctx, "wal.open", trace.WithAttributes(
+		attribute.String(attrWalPath, path),
+		attribute.Bool(attrWalSyncOnWrite, opts.SyncOnWrite),
+		attribute.Int64("wal.max_segment_size", int64(opts.MaxSegmentSize)),
+		attribute.Int("wal.max_global_segment", int(opts.MaxGlobalSegment)),
+	))
+	defer span.End()
+
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else if walInstance != nil {
+			span.SetAttributes(
+				attribute.Int(attrWalSlotID, walInstance.activeSeg.slotID),
+				attribute.Int64(attrWalNextSeq, int64(walInstance.nextSeq)),
+				attribute.Int(attrWalSegments, len(walInstance.oldSegments)+1),
+				attribute.Int64(attrWalActiveSize, int64(walInstance.activeSize)),
+			)
+			span.SetStatus(codes.Ok, "")
+		}
+	}()
+
 	logger := opts.Logger
 	if logger == nil {
 		logger = zap.L()
@@ -223,7 +272,7 @@ func Open(path string, opts Options) (*WAL, error) {
 	logger = logger.With(zap.String("wal_path", path))
 
 	wal := &WAL{path: path, options: &opts, logger: logger}
-	err := os.MkdirAll(path, 0o755)
+	err = os.MkdirAll(path, 0o755)
 	if err != nil {
 		logger.Error("failed to create WAL directory", zap.Error(err))
 		return nil, err
@@ -241,11 +290,11 @@ func Open(path string, opts Options) (*WAL, error) {
 
 	var segs []segmentInfo
 	for _, m := range matches {
-		bSeq, mSeq, err := readSegmentHeader(m)
-		if err != nil {
+		bSeq, mSeq, hErr := readSegmentHeader(m)
+		if hErr != nil {
 			logger.Warn("skipping corrupted or unreadable segment header",
 				zap.String("path", m),
-				zap.Error(err),
+				zap.Error(hErr),
 			)
 			continue // ignore corrupted or empty slots
 		}
@@ -270,10 +319,10 @@ func Open(path string, opts Options) (*WAL, error) {
 
 	if len(segs) == 0 {
 		wal.nextSeq = 0
-		segFile, idxFile, info, err := createSegment(logger, path, 0, wal.nextSeq)
-		if err != nil {
-			logger.Error("failed to create initial segment", zap.Error(err))
-			return nil, err
+		segFile, idxFile, info, createErr := createSegment(logger, path, 0, wal.nextSeq)
+		if createErr != nil {
+			logger.Error("failed to create initial segment", zap.Error(createErr))
+			return nil, createErr
 		}
 		wal.file = segFile
 		wal.idxFile = idxFile
@@ -287,61 +336,61 @@ func Open(path string, opts Options) (*WAL, error) {
 		wal.oldSegments = segs[:len(segs)-1]
 		wal.activeSeg = segs[len(segs)-1]
 
-		f, err := os.OpenFile(wal.activeSeg.path, os.O_RDWR, 0o644)
-		if err != nil {
+		f, openErr := os.OpenFile(wal.activeSeg.path, os.O_RDWR, 0o644)
+		if openErr != nil {
 			logger.Error("failed to open active segment file",
 				zap.String("path", wal.activeSeg.path),
-				zap.Error(err),
+				zap.Error(openErr),
 			)
-			return nil, err
+			return nil, openErr
 		}
-		if _, err := f.Seek(0, io.SeekEnd); err != nil {
+		if _, seekErr := f.Seek(0, io.SeekEnd); seekErr != nil {
 			logger.Error("failed to seek active segment file to end",
 				zap.String("path", wal.activeSeg.path),
-				zap.Error(err),
+				zap.Error(seekErr),
 			)
 			_ = f.Close()
-			return nil, err
+			return nil, seekErr
 		}
 		wal.file = f
 
-		idxF, err := os.OpenFile(wal.activeSeg.idxPath, os.O_RDWR, 0o644)
-		if err != nil {
+		idxF, openErr := os.OpenFile(wal.activeSeg.idxPath, os.O_RDWR, 0o644)
+		if openErr != nil {
 			logger.Error("failed to open active index file",
 				zap.String("path", wal.activeSeg.idxPath),
-				zap.Error(err),
+				zap.Error(openErr),
 			)
 			_ = f.Close()
-			return nil, err
+			return nil, openErr
 		}
-		if _, err := idxF.Seek(0, io.SeekEnd); err != nil {
+		if _, seekErr := idxF.Seek(0, io.SeekEnd); seekErr != nil {
 			logger.Error("failed to seek active index file to end",
 				zap.String("path", wal.activeSeg.idxPath),
-				zap.Error(err),
+				zap.Error(seekErr),
 			)
 			_ = f.Close()
 			_ = idxF.Close()
-			return nil, err
+			return nil, seekErr
 		}
 		wal.idxFile = idxF
 
-		stat, err := f.Stat()
-		if err != nil {
+		stat, statErr := f.Stat()
+		if statErr != nil {
 			logger.Error("failed to stat active segment file",
 				zap.String("path", wal.activeSeg.path),
-				zap.Error(err),
+				zap.Error(statErr),
 			)
-			return nil, err
+			return nil, statErr
 		}
 		wal.activeSize = uint64(stat.Size())
 
-		idxStat, err := idxF.Stat()
-		if err != nil {
+		idxStat, statErr := idxF.Stat()
+		if statErr != nil {
 			logger.Error("failed to stat active index file",
 				zap.String("path", wal.activeSeg.idxPath),
-				zap.Error(err),
+				zap.Error(statErr),
 			)
-			return nil, err
+			return nil, statErr
 		}
 
 		// The number of 8-byte entries in the index file dictates our next sequence
@@ -357,6 +406,8 @@ func Open(path string, opts Options) (*WAL, error) {
 			zap.Uint64("active_size", wal.activeSize),
 		)
 	}
+
+	wal.telemetry = newWALTelemetry(wal, opts.TracerProvider, opts.MeterProvider, wal.logger)
 
 	wal.closeCh = make(chan struct{})
 	if !opts.SyncOnWrite && opts.SyncInterval > 0 {
@@ -387,6 +438,12 @@ func (w *WAL) syncLoop() {
 }
 
 // Append writes a new record to the WAL and returns its globally unique sequence number.
+// It is equivalent to AppendContext with context.Background().
+func (w *WAL) Append(data []byte) (uint64, error) {
+	return w.AppendContext(context.Background(), data)
+}
+
+// AppendContext writes a new record to the WAL using the provided context for OpenTelemetry tracing and metrics.
 //
 // Theory:
 // Append achieves high performance because it only does sequential writes to the active file.
@@ -394,13 +451,61 @@ func (w *WAL) syncLoop() {
 // "Segment Rotation". It seals the current file and opens a new one.
 // The index file (.idx) is also updated concurrently so that this new record can be instantly
 // found without scanning the segment file.
-func (w *WAL) Append(data []byte) (uint64, error) {
+func (w *WAL) AppendContext(ctx context.Context, data []byte) (seq uint64, err error) {
+	var tracer trace.Tracer
+	if w.telemetry != nil && w.telemetry.tracer != nil {
+		tracer = w.telemetry.tracer
+	} else {
+		tracer = otel.GetTracerProvider().Tracer(instrumentationScope)
+	}
+
+	ctx, span := tracer.Start(ctx, "wal.append", trace.WithAttributes(
+		attribute.String(attrWalPath, w.path),
+		attribute.Int(attrWalPayloadBytes, len(data)),
+	))
+	defer span.End()
+
+	startTime := time.Now()
+	var finalActiveSize uint64
+
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		status := statusOK
+		if err != nil {
+			status = statusError
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else {
+			span.SetStatus(codes.Ok, "")
+			span.SetAttributes(
+				attribute.Int64(attrWalSeq, int64(seq)),
+				attribute.Int64(attrWalActiveSize, int64(finalActiveSize)),
+			)
+		}
+
+		if w.telemetry != nil {
+			pathAttr := attribute.String(attrWalPath, w.path)
+			statusAttr := attribute.String(attrWalStatus, status)
+
+			if w.telemetry.appendsCounter != nil {
+				w.telemetry.appendsCounter.Add(ctx, 1, metric.WithAttributes(pathAttr, statusAttr))
+			}
+			if w.telemetry.appendDuration != nil {
+				w.telemetry.appendDuration.Record(ctx, duration, metric.WithAttributes(pathAttr, statusAttr))
+			}
+			if err == nil && w.telemetry.appendBytesCounter != nil {
+				w.telemetry.appendBytesCounter.Add(ctx, int64(len(data)), metric.WithAttributes(pathAttr))
+			}
+		}
+	}()
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
-	seq := w.nextSeq
+	seq = w.nextSeq
 	encoded := record.Encode(seq, data)
 	logSize := uint64(len(encoded))
+	span.SetAttributes(attribute.Int(attrWalRecordBytes, len(encoded)))
 
 	if w.activeSize+logSize > w.options.MaxSegmentSize {
 		w.activeSeg.maxSeq = seq - 1
@@ -413,10 +518,10 @@ func (w *WAL) Append(data []byte) (uint64, error) {
 
 		headerMax := make([]byte, 8)
 		binary.LittleEndian.PutUint64(headerMax, w.activeSeg.maxSeq)
-		if _, err := w.file.WriteAt(headerMax, maxSeqOffset); err != nil {
+		if _, writeErr := w.file.WriteAt(headerMax, maxSeqOffset); writeErr != nil {
 			w.logger.Error("failed to write max sequence in header on rotation",
 				zap.Int("slot_id", w.activeSeg.slotID),
-				zap.Error(err),
+				zap.Error(writeErr),
 			)
 		}
 		_ = w.file.Sync()
@@ -444,14 +549,24 @@ func (w *WAL) Append(data []byte) (uint64, error) {
 			}
 		}
 
-		segFile, idxFile, info, err := createSegment(w.logger, w.path, nextSlot, seq)
-		if err != nil {
+		segFile, idxFile, info, rotErr := createSegment(w.logger, w.path, nextSlot, seq)
+		if rotErr != nil {
 			w.logger.Error("failed to create new segment during rotation",
 				zap.Int("slot_id", nextSlot),
-				zap.Error(err),
+				zap.Error(rotErr),
 			)
-			return 0, err
+			return 0, rotErr
 		}
+
+		if w.telemetry != nil && w.telemetry.rotationsCounter != nil {
+			w.telemetry.rotationsCounter.Add(ctx, 1, metric.WithAttributes(attribute.String(attrWalPath, w.path)))
+		}
+		span.AddEvent("wal.segment_rotation", trace.WithAttributes(
+			attribute.Int("wal.sealed_slot", w.activeSeg.slotID),
+			attribute.Int64("wal.sealed_base_seq", int64(w.activeSeg.baseSeq)),
+			attribute.Int64("wal.sealed_max_seq", int64(w.activeSeg.maxSeq)),
+			attribute.Int("wal.next_slot", nextSlot),
+		))
 
 		w.file = segFile
 		w.idxFile = idxFile
@@ -462,35 +577,36 @@ func (w *WAL) Append(data []byte) (uint64, error) {
 	// 1. Write the offset to the index file (8 bytes)
 	offsetBuf := make([]byte, 8)
 	binary.LittleEndian.PutUint64(offsetBuf, w.activeSize)
-	_, err := w.idxFile.Write(offsetBuf)
-	if err != nil {
+	_, writeErr := w.idxFile.Write(offsetBuf)
+	if writeErr != nil {
 		w.logger.Error("failed to write index entry",
 			zap.Uint64("seq", seq),
 			zap.Uint64("offset", w.activeSize),
-			zap.Error(err),
+			zap.Error(writeErr),
 		)
-		return 0, err
+		return 0, writeErr
 	}
 
 	// 2. Write the actual data to the segment file
-	_, err = w.file.Write(encoded)
-	if err != nil {
+	_, writeErr = w.file.Write(encoded)
+	if writeErr != nil {
 		w.logger.Error("failed to write record data",
 			zap.Uint64("seq", seq),
-			zap.Error(err),
+			zap.Error(writeErr),
 		)
-		return 0, err
+		return 0, writeErr
 	}
 
 	w.activeSize += logSize
 	w.nextSeq++
+	finalActiveSize = w.activeSize
 
 	if w.options.SyncOnWrite {
-		if err := w.idxFile.Sync(); err != nil {
-			w.logger.Error("failed to sync index file on write", zap.Uint64("seq", seq), zap.Error(err))
+		if syncErr := w.idxFile.Sync(); syncErr != nil {
+			w.logger.Error("failed to sync index file on write", zap.Uint64("seq", seq), zap.Error(syncErr))
 		}
-		if err := w.file.Sync(); err != nil {
-			w.logger.Error("failed to sync segment file on write", zap.Uint64("seq", seq), zap.Error(err))
+		if syncErr := w.file.Sync(); syncErr != nil {
+			w.logger.Error("failed to sync segment file on write", zap.Uint64("seq", seq), zap.Error(syncErr))
 		}
 	}
 
@@ -505,6 +621,13 @@ func (w *WAL) Append(data []byte) (uint64, error) {
 }
 
 // Read retrieves a record's data payload given its exact sequence number.
+// It is equivalent to ReadContext with context.Background().
+func (w *WAL) Read(seq uint64) ([]byte, error) {
+	return w.ReadContext(context.Background(), seq)
+}
+
+// ReadContext retrieves a record's data payload given its exact sequence number
+// using the provided context for OpenTelemetry tracing and metrics.
 //
 // Theory:
 // Without an index, reading a specific record would require O(N) scanning of the file
@@ -512,7 +635,56 @@ func (w *WAL) Append(data []byte) (uint64, error) {
 // It mathematically computes the byte position in the index file (seq * 8), reads the exact
 // 8-byte offset, and then performs a single disk seek/read in the segment (.seg) file
 // to fetch the desired record data.
-func (w *WAL) Read(seq uint64) ([]byte, error) {
+func (w *WAL) ReadContext(ctx context.Context, seq uint64) (data []byte, err error) {
+	var tracer trace.Tracer
+	if w.telemetry != nil && w.telemetry.tracer != nil {
+		tracer = w.telemetry.tracer
+	} else {
+		tracer = otel.GetTracerProvider().Tracer(instrumentationScope)
+	}
+
+	ctx, span := tracer.Start(ctx, "wal.read", trace.WithAttributes(
+		attribute.String(attrWalPath, w.path),
+		attribute.Int64(attrWalSeq, int64(seq)),
+	))
+	defer span.End()
+
+	startTime := time.Now()
+
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		status := statusOK
+		if err != nil {
+			if errors.Is(err, ErrNotFound) {
+				status = statusNotFound
+			} else {
+				status = statusError
+			}
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else {
+			span.SetStatus(codes.Ok, "")
+			span.SetAttributes(
+				attribute.Int(attrWalPayloadBytes, len(data)),
+			)
+		}
+
+		if w.telemetry != nil {
+			pathAttr := attribute.String(attrWalPath, w.path)
+			statusAttr := attribute.String(attrWalStatus, status)
+
+			if w.telemetry.readsCounter != nil {
+				w.telemetry.readsCounter.Add(ctx, 1, metric.WithAttributes(pathAttr, statusAttr))
+			}
+			if w.telemetry.readDuration != nil {
+				w.telemetry.readDuration.Record(ctx, duration, metric.WithAttributes(pathAttr, statusAttr))
+			}
+			if err == nil && w.telemetry.readBytesCounter != nil {
+				w.telemetry.readBytesCounter.Add(ctx, int64(len(data)), metric.WithAttributes(pathAttr))
+			}
+		}
+	}()
+
 	w.mu.RLock()
 	defer w.mu.RUnlock()
 
@@ -536,6 +708,8 @@ func (w *WAL) Read(seq uint64) ([]byte, error) {
 			return nil, ErrNotFound
 		}
 	}
+
+	span.SetAttributes(attribute.Int(attrWalSlotID, targetSeg.slotID))
 
 	// 1. Read the offset from the .idx file
 	// Each index entry is 8 bytes. The entry for 'seq' is at byte (seq - baseSeq) * 8
@@ -627,27 +801,101 @@ func (w *WAL) Read(seq uint64) ([]byte, error) {
 	return rec.Data, nil
 }
 
+// Sync forces a flush of active WAL files to persistent storage.
+// It is equivalent to SyncContext with context.Background().
 func (w *WAL) Sync() error {
+	return w.SyncContext(context.Background())
+}
+
+// SyncContext forces a flush of active WAL files to persistent storage
+// using the provided context for OpenTelemetry tracing and metrics.
+func (w *WAL) SyncContext(ctx context.Context) (err error) {
+	var tracer trace.Tracer
+	if w.telemetry != nil && w.telemetry.tracer != nil {
+		tracer = w.telemetry.tracer
+	} else {
+		tracer = otel.GetTracerProvider().Tracer(instrumentationScope)
+	}
+
+	ctx, span := tracer.Start(ctx, "wal.sync", trace.WithAttributes(
+		attribute.String(attrWalPath, w.path),
+	))
+	defer span.End()
+
+	startTime := time.Now()
+	defer func() {
+		duration := time.Since(startTime).Seconds()
+		status := statusOK
+		if err != nil {
+			status = statusError
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else {
+			span.SetStatus(codes.Ok, "")
+		}
+
+		if w.telemetry != nil {
+			pathAttr := attribute.String(attrWalPath, w.path)
+			statusAttr := attribute.String(attrWalStatus, status)
+
+			if w.telemetry.syncsCounter != nil {
+				w.telemetry.syncsCounter.Add(ctx, 1, metric.WithAttributes(pathAttr, statusAttr))
+			}
+			if w.telemetry.syncDuration != nil {
+				w.telemetry.syncDuration.Record(ctx, duration, metric.WithAttributes(pathAttr, statusAttr))
+			}
+		}
+	}()
+
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
 	w.logger.Debug("syncing WAL to disk")
 
 	if w.idxFile != nil {
-		if err := w.idxFile.Sync(); err != nil {
-			w.logger.Error("failed to sync active index file", zap.Error(err))
+		if syncErr := w.idxFile.Sync(); syncErr != nil {
+			w.logger.Error("failed to sync active index file", zap.Error(syncErr))
 		}
 	}
 	if w.file != nil {
-		if err := w.file.Sync(); err != nil {
-			w.logger.Error("failed to sync active segment file", zap.Error(err))
-			return err
+		if syncErr := w.file.Sync(); syncErr != nil {
+			w.logger.Error("failed to sync active segment file", zap.Error(syncErr))
+			return syncErr
 		}
 	}
 	return nil
 }
 
+// Close gracefully flushes and closes active WAL resources.
+// It is equivalent to CloseContext with context.Background().
 func (w *WAL) Close() error {
+	return w.CloseContext(context.Background())
+}
+
+// CloseContext gracefully flushes and closes active WAL resources
+// using the provided context for OpenTelemetry tracing.
+func (w *WAL) CloseContext(ctx context.Context) (err error) {
+	var tracer trace.Tracer
+	if w.telemetry != nil && w.telemetry.tracer != nil {
+		tracer = w.telemetry.tracer
+	} else {
+		tracer = otel.GetTracerProvider().Tracer(instrumentationScope)
+	}
+
+	ctx, span := tracer.Start(ctx, "wal.close", trace.WithAttributes(
+		attribute.String(attrWalPath, w.path),
+	))
+	defer span.End()
+
+	defer func() {
+		if err != nil {
+			span.RecordError(err)
+			span.SetStatus(codes.Error, err.Error())
+		} else {
+			span.SetStatus(codes.Ok, "")
+		}
+	}()
+
 	w.logger.Info("closing WAL")
 
 	if w.closeCh != nil {
@@ -661,20 +909,27 @@ func (w *WAL) Close() error {
 	var firstErr error
 	if w.idxFile != nil {
 		_ = w.idxFile.Sync()
-		if err := w.idxFile.Close(); err != nil {
-			w.logger.Error("failed to close active index file", zap.Error(err))
-			firstErr = err
+		if closeErr := w.idxFile.Close(); closeErr != nil {
+			w.logger.Error("failed to close active index file", zap.Error(closeErr))
+			firstErr = closeErr
 		}
 	}
 	if w.file != nil {
 		_ = w.file.Sync()
-		if err := w.file.Close(); err != nil {
-			w.logger.Error("failed to close active segment file", zap.Error(err))
+		if closeErr := w.file.Close(); closeErr != nil {
+			w.logger.Error("failed to close active segment file", zap.Error(closeErr))
 			if firstErr == nil {
-				firstErr = err
+				firstErr = closeErr
 			}
 		}
 	}
+
+	if telemErr := w.telemetry.Close(); telemErr != nil {
+		if firstErr == nil {
+			firstErr = telemErr
+		}
+	}
+
 	if firstErr != nil {
 		return firstErr
 	}
